@@ -18,28 +18,10 @@ from storages.interfaces import S3StorageInterface
 router = APIRouter()
 
 
-@router.post(
-    "/users/{user_id}/profile/",
-    response_model=ProfileResponseSchema,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create User Profile",
-)
-async def create_profile(
-    user_id: int,
-    first_name: str = Form(...),
-    last_name: str = Form(...),
-    gender: str = Form(...),
-    date_of_birth: str = Form(...),
-    info: str = Form(...),
-    avatar: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db),
-    token: str = Depends(get_token),
-    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
-    storage: S3StorageInterface = Depends(get_s3_storage_client),
-):
+def _decode_token(token: str, jwt_manager: JWTAuthManagerInterface) -> int:
     try:
         token_data = jwt_manager.decode_access_token(token)
-        token_user_id = token_data.get("user_id")
+        return token_data.get("user_id")
     except Exception as e:
         error_msg = str(e)
         if "expired" in error_msg.lower() or "expire" in error_msg.lower():
@@ -52,42 +34,25 @@ async def create_profile(
             detail="Invalid or expired credentials.",
         )
 
-    stmt_current_user = select(UserModel).where(UserModel.id == token_user_id)
-    result_current_user = await db.execute(stmt_current_user)
-    current_user = result_current_user.scalars().first()
 
-    if not current_user or not getattr(current_user, "is_active", False):
+async def _get_active_user(user_id: int, db: AsyncSession) -> UserModel:
+    stmt = select(UserModel).where(UserModel.id == user_id)
+    result = await db.execute(stmt)
+    user = result.scalars().first()
+    if not user or not getattr(user, "is_active", False):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found or not active.",
         )
+    return user
 
-    if token_user_id == user_id:
-        target_user = current_user
-    else:
-        stmt_target_user = select(UserModel).where(UserModel.id == user_id)
-        result_target_user = await db.execute(stmt_target_user)
-        target_user = result_target_user.scalars().first()
 
-    if not target_user or not getattr(target_user, "is_active", False):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found or not active.",
-        )
-
-    is_admin = getattr(current_user, "group_id", 1) == 3
-    if token_user_id != user_id and not is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You don't have permission to edit this profile.",
-        )
-
+def _validate_names_and_info(first_name: str, last_name: str, info: str):
     if not info or not info.strip():
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Info field cannot be empty or contain only spaces.",
         )
-
     if not re.match(r"^[a-zA-Z]+$", first_name):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -99,15 +64,17 @@ async def create_profile(
             detail=f"{last_name} contains non-english letters",
         )
 
+
+def _validate_birth_and_gender(date_of_birth: str, gender: str):
     try:
-        parsed_birth_date = datetime.strptime(date_of_birth, "%Y-%m-%d").date()
+        parsed_date = datetime.strptime(date_of_birth, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Invalid birth date format. Expected YYYY-MM-DD.",
         )
 
-    if parsed_birth_date.year <= 1900:
+    if parsed_date.year <= 1900:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Invalid birth date - year must be greater than 1900.",
@@ -116,8 +83,8 @@ async def create_profile(
     today = date.today()
     age = (
         today.year
-        - parsed_birth_date.year
-        - ((today.month, today.day) < (parsed_birth_date.month, parsed_birth_date.day))
+        - parsed_date.year
+        - ((today.month, today.day) < (parsed_date.month, parsed_date.day))
     )
     if age < 18:
         raise HTTPException(
@@ -130,8 +97,10 @@ async def create_profile(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Gender must be one of the allowed options.",
         )
-    db_gender = GenderEnum(gender)
+    return parsed_date, GenderEnum(gender)
 
+
+async def _validate_and_read_avatar(avatar: UploadFile) -> bytes:
     if avatar.content_type not in ["image/jpeg", "image/png", "image/jpg"]:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -151,6 +120,44 @@ async def create_profile(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Image size exceeds 1 MB",
         )
+    return file_data
+
+
+@router.post(
+    "/users/{user_id}/profile/",
+    response_model=ProfileResponseSchema,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create User Profile",
+)
+async def create_profile(
+    user_id: int,
+    first_name: str = Form(...),
+    last_name: str = Form(...),
+    gender: str = Form(...),
+    date_of_birth: str = Form(...),
+    info: str = Form(...),
+    avatar: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(get_token),
+    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
+    storage: S3StorageInterface = Depends(get_s3_storage_client),
+):
+    token_user_id = _decode_token(token, jwt_manager)
+    current_user = await _get_active_user(token_user_id, db)
+
+    if token_user_id != user_id:
+        await _get_active_user(user_id, db)
+
+    is_admin = getattr(current_user, "group_id", 1) == 3
+    if token_user_id != user_id and not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You don't have permission to edit this profile.",
+        )
+
+    _validate_names_and_info(first_name, last_name, info)
+    parsed_birth_date, db_gender = _validate_birth_and_gender(date_of_birth, gender)
+    file_data = await _validate_and_read_avatar(avatar)
 
     stmt_profile_exists = select(UserProfileModel).where(
         UserProfileModel.user_id == user_id
