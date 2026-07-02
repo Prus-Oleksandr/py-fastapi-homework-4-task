@@ -132,7 +132,12 @@ async def register_user(
             detail="An error occurred during user creation.",
         ) from e
     else:
-        activation_link = f"http://127.0.0.1:8000/accounts/activate/?token={activation_token.token}&email={new_user.email}"
+        activation_link = (
+            f"http://127.0.0.1:8000/accounts/activate/"
+            f"?token={activation_token.token}"
+            f"&email={new_user.email}"
+        )
+
         background_tasks.add_task(
             email_sender.send_activation_email,
             str(new_user.email),
